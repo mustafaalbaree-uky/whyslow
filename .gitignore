@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+build/
+build-sim/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
