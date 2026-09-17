@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """whyslow: work out why this Mac is slow, and offer to reclaim what it can.
 
-Read only by default. Nothing is killed or deleted unless you pass --fix and
-then say yes to each action individually.
+By default the measurements go to Claude, which writes a short plan, and one
+Enter runs the steps whyslow can do itself. Anything that deletes data asks
+again on its own. --plain skips Claude and prints the rule based report.
 """
 
 import argparse
@@ -47,11 +48,14 @@ class Finding:
 class Fix:
     """A reclaim action. `cmd` is a list, or a callable returning (ok, message)."""
 
-    def __init__(self, label, cmd, gain=None, caution=None):
+    def __init__(self, label, cmd, gain=None, caution=None, heavy=False):
         self.label = label
         self.cmd = cmd
         self.gain = gain
         self.caution = caution
+        # heavy fixes delete data or take a long time, so they always ask on their own
+        self.heavy = heavy
+        self.id = None
 
 
 # ------------------------------------------------------------------ plumbing
@@ -182,24 +186,27 @@ def _reclaimable():
             HIGH if found > 8 * 1024**3 else MED, "Build artifact",
             detail + " reclaim finds it and knows which directories are really source.",
             fix=Fix("Hand it to reclaim", ["reclaim", "--clean"], gain=eligible,
-                    caution="reclaim asks again and makes you type the word delete."),
+                    caution="reclaim asks again and makes you type the word delete.", heavy=True),
         ))
 
     runtimes = _simulator_runtimes()
-    if runtimes:
-        total = sum(r["bytes"] for r in runtimes)
-        if total > 3 * 1024**3:
-            out.append(Finding(
-                HIGH, "Simulator runtimes",
-                f"{human(total)} of simulator runtimes. Builds here go to the physical "
-                "iPhone, so these are only needed if you actually open a simulator. "
-                "reclaim does not cover these, it handles simulator devices instead.",
-                evidence=[f"{human(r['bytes']):>9}  {r['name']}" for r in runtimes],
-                fix=Fix("Delete every installed simulator runtime",
-                        ["xcrun", "simctl", "runtime", "delete", "all"],
-                        gain=total,
-                        caution="Xcode redownloads one on demand, which is a slow download."),
-            ))
+    # The newest iOS runtime is also the device build platform for the iPhone,
+    # so it is never offered for deletion.
+    ios = [r for r in runtimes if r["name"].startswith("iOS") and r["uuid"]]
+    keep = max(ios, key=lambda r: [int(x) for x in re.findall(r"\d+", r["name"])[:3]]) if ios else None
+    spare = [r for r in runtimes if r["uuid"] and r is not keep]
+    total = sum(r["bytes"] for r in spare)
+    if spare and total > 3 * 1024**3:
+        out.append(Finding(
+            HIGH, "Simulator runtimes",
+            f"{human(total)} of simulator runtimes besides the newest iOS one, which stays "
+            "because device builds need it.",
+            evidence=[f"{human(r['bytes']):>9}  {r['name']}" for r in spare],
+            fix=Fix(f"Delete {len(spare)} spare simulator runtime(s)",
+                    " && ".join(f"xcrun simctl runtime delete {r['uuid']}" for r in spare),
+                    gain=total, heavy=True,
+                    caution="Xcode redownloads one on demand, which is a slow download."),
+        ))
 
     trash = os.path.join(HOME, ".Trash")
     size = dir_size(trash)
@@ -222,7 +229,8 @@ def _reclaimable():
             evidence=[s[:70] for s in snaps],
             fix=Fix("Thin local snapshots to reclaim up to 20 GB",
                     ["tmutil", "thinlocalsnapshots", "/", "21474836480", "4"],
-                    caution="Removes local restore points. Your real backups are untouched."),
+                    caution="Removes local restore points. Your real backups are untouched.",
+                    heavy=True),
         ))
 
     big = []
@@ -252,9 +260,9 @@ def _simulator_runtimes():
     out = sh(["xcrun", "simctl", "runtime", "list"], timeout=30)
     runtimes = []
     for line in out.splitlines():
-        m = re.match(r"\s*((?:iOS|watchOS|tvOS|visionOS) [\d.]+ \(([\w.]+)\))", line)
+        m = re.match(r"\s*((?:iOS|watchOS|tvOS|visionOS) [\d.]+ \(([\w.]+)\))(?: - ([0-9A-F-]{36}))?", line)
         if m:
-            runtimes.append({"name": m.group(1), "build": m.group(2), "bytes": 0})
+            runtimes.append({"name": m.group(1), "build": m.group(2), "uuid": m.group(3), "bytes": 0})
     if not runtimes:
         return []
     root = "/Library/Developer/CoreSimulator"
@@ -268,7 +276,7 @@ def _simulator_runtimes():
                     r["bytes"] = size
     unaccounted = total - sum(r["bytes"] for r in runtimes)
     if unaccounted > 512 * 1024**2:
-        runtimes.append({"name": "simulator caches", "build": "", "bytes": unaccounted})
+        runtimes.append({"name": "simulator caches", "build": "", "uuid": None, "bytes": unaccounted})
     return [r for r in runtimes if r["bytes"] > 0]
 
 
@@ -388,6 +396,7 @@ def check_load():
     busy = sorted([p for p in processes() if p["cpu"] > 15], key=lambda p: -p["cpu"])[:6]
     ev = [f"{p['cpu']:>5.1f}%  pid {p['pid']:<7} {p['name']}" for p in busy]
 
+    idle = cpu_idle()
     if per_core > 1.6:
         sev, word = CRIT, "far more work queued than it can run"
     elif per_core > 1.0:
@@ -397,9 +406,61 @@ def check_load():
     else:
         return [Finding(OK, "CPU load", f"Load {la:.1f} across {cores} cores.")]
 
-    return [Finding(sev, "CPU is saturated",
-                    f"Load average {la:.1f} across {cores} cores, {word}.",
-                    evidence=ev)]
+    # macOS load average also counts threads waiting on disk and locks, so a
+    # spike with idle cores is a stall, not a CPU shortage.
+    if idle is not None and idle > 50:
+        return [Finding(MED if sev == CRIT else LOW, "Load spike with idle CPU",
+                        f"Load average {la:.1f} across {cores} cores while the CPU is "
+                        f"{idle:.0f} percent idle. Threads are waiting, not computing.",
+                        evidence=ev)]
+
+    detail = f"Load average {la:.1f} across {cores} cores, {word}."
+    if idle is not None:
+        detail += f" CPU {idle:.0f} percent idle."
+    return [Finding(sev, "CPU is saturated", detail, evidence=ev)]
+
+
+def live_cpu():
+    """(idle percent, {pid: cpu percent}) over one second, from top's second sample.
+
+    ps reports a decaying average that can show a process busy a minute after it
+    stopped, so anything that names a busy process uses this instead."""
+    if getattr(live_cpu, "_cache", None) is not None:
+        return live_cpu._cache
+    out = sh(["top", "-l", "2", "-s", "1", "-n", "60", "-o", "cpu", "-stats", "pid,cpu"], timeout=15)
+    idle, per = None, {}
+    samples = out.split("Processes:")
+    if len(samples) >= 3:
+        last = samples[-1]
+        m = re.search(r"([\d.]+)% idle", last)
+        idle = float(m.group(1)) if m else None
+        for line in last.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit():
+                try:
+                    per[int(parts[0])] = float(parts[1])
+                except ValueError:
+                    pass
+    live_cpu._cache = (idle, per)
+    if per:
+        for p in processes():
+            p["cpu"] = per.get(p["pid"], 0.0)
+    return live_cpu._cache
+
+
+
+def cpu_idle():
+    return live_cpu()[0]
+
+
+def launchd_pids():
+    """Pids launchd keeps alive. Killing one only restarts it."""
+    pids = set()
+    for line in sh(["launchctl", "list"]).splitlines():
+        parts = line.split(None, 2)
+        if parts and parts[0].isdigit():
+            pids.add(int(parts[0]))
+    return pids
 
 
 def check_stale_servers():
@@ -415,9 +476,10 @@ def check_stale_servers():
         (r"claude-usage.*dashboard", "claude-usage dashboard"),
         (r"jekyll|hugo serve", "static site server"),
     ]
+    managed = launchd_pids()
     stale = []
     for p in processes():
-        if p["age"] < 6 * 3600:
+        if p["age"] < 6 * 3600 or p["pid"] in managed or p["ppid"] in managed:
             continue
         for pat, label in patterns:
             if re.search(pat, p["cmd"], re.I):
@@ -427,25 +489,40 @@ def check_stale_servers():
     if not stale:
         return [Finding(OK, "Background servers", "Nothing left running from an old session.")]
 
-    ev = []
-    pids = []
-    for p, label in sorted(stale, key=lambda x: -x[0]["age"]):
-        proj = ""
-        pm = re.search(r"/Code/([^/]+)", p["cmd"])
-        if pm:
-            proj = f" ({pm.group(1)})"
-        ev.append(f"{duration(p['age']):>5} old  pid {p['pid']:<7} {label}{proj}")
-        pids.append(str(p["pid"]))
+    # One finding per project, so each can be stopped on its own. A launcher and
+    # the server it started (uv run and uvicorn) land in the same group.
+    groups = {}
+    for p, label in stale:
+        pm = re.search(r"/Code/([^/]+)", p["cmd"]) or re.search(r"--port[ =](\d+)", p["cmd"])
+        key = pm.group(1) if pm else str(p["pid"])
+        port = re.search(r"--port[ =](\d+)", p["cmd"])
+        for k, g in groups.items():
+            if port and port.group(1) in g["ports"]:
+                key = k
+        g = groups.setdefault(key, {"procs": [], "label": label, "ports": set(), "project": None})
+        g["procs"].append(p)
+        if port:
+            g["ports"].add(port.group(1))
+        proj = re.search(r"/Code/([^/]+)", p["cmd"])
+        if proj:
+            g["project"] = proj.group(1)
 
-    ram = sum(p["rss"] for p, _ in stale)
-    return [Finding(
-        HIGH if ram > 0.10 * total_ram() else MED if ram > 0.02 * total_ram() else LOW,
-        "Dev servers still running",
-        f"{len(stale)} server(s) from earlier sessions are still up, holding {human(ram)}.",
-        evidence=ev,
-        fix=Fix(f"Stop all {len(stale)} of them", ["kill"] + pids,
-                gain=ram, caution="Restart any you still want with the project's usual command."),
-    )]
+    findings = []
+    for key, g in groups.items():
+        procs = sorted(g["procs"], key=lambda p: -p["age"])
+        name = g["project"] or g["label"]
+        ram = sum(p["rss"] for p in procs)
+        ports = ", ".join(sorted(g["ports"]))
+        findings.append(Finding(
+            HIGH if ram > 0.10 * total_ram() else MED if ram > 0.02 * total_ram() else LOW,
+            f"Old dev server: {name}",
+            f"{g['label']} up for {duration(procs[0]['age'])}"
+            + (f" on port {ports}" if ports else "") + f", holding {human(ram)}.",
+            evidence=[f"pid {p['pid']:<7} {p['cmd'][:90]}" for p in procs],
+            fix=Fix(f"Stop the {name} server" if g["project"] else f"Stop the {name}", ["kill"] + [str(p["pid"]) for p in procs],
+                    gain=ram, caution="Restart it with the project's usual command."),
+        ))
+    return findings
 
 
 def check_duplicates():
@@ -461,6 +538,9 @@ def check_duplicates():
         if key:
             seen.setdefault(key, []).append(p)
 
+    for k, v in seen.items():
+        pids = {p["pid"] for p in v}
+        seen[k] = [p for p in v if p["ppid"] not in pids]
     dupes = {k: v for k, v in seen.items() if len(v) > 1}
     if not dupes:
         return []
@@ -595,6 +675,355 @@ CHECKS = [
 ]
 
 
+# ------------------------------------------------------------------- advisor
+
+ADVISOR_PROMPT = """You are the advisor inside whyslow, a command line tool on Mustafa's Mac.
+He runs it when the Mac feels slow. It has already measured everything and ran
+rule based checks (the findings). The rules are crude, so you decide what is
+actually going on and what he should do right now.
+
+How to judge:
+- Separate load he chose from waste. A video call, lecture stream, build or
+  model run he is in the middle of is expected. Name it plainly as the cause and
+  do not tell him to stop it unless it is clearly left over (for example a call
+  tab still busy long after a meeting would have ended).
+- Match browser content processes to the open tabs. A heavy browser content
+  process plus coreaudiod and video decoder activity usually means a call or
+  video in a tab; name the tab he would recognise.
+- A server whose port appears in an open tab, or that the port registry says is
+  a LaunchAgent, is in use. Never suggest stopping it.
+- Process cpu_pct values are a live one second sample. macOS load average
+  counts threads waiting on disk and locks, so trust cpu_idle_pct over it.
+- A local server with connected_clients_now is being used by something.
+- Swap and compressed memory linger for days. They only matter when
+  memory_pressure is not normal.
+- Findings marked severe can be wrong; overrule them. If nothing meaningful is
+  slowing the Mac, say so and return no steps.
+
+Output:
+- headline: at most two sentences. What is making it slow right now, in terms
+  he recognises (app, tab, project), with the key number.
+- steps: at most 5, most impactful first, only ones worth doing. Each step's
+  text is one short sentence saying what to do. Set fix to an id from
+  available_fixes only when that exact action is the right thing; otherwise fix
+  is null and he does the step himself.
+
+Writing rules, strict:
+- Facts only. No reassurance, no coaching, no explaining your reasoning, no
+  "don't worry", no "that's fine", no "that's expected", no "nothing owed".
+  State what is using the CPU and stop.
+- Every number and duration must come from the data. Uptime is the uptime
+  field, not a process age.
+- Plain, specific, short. Use app names and tab titles, not pids or internal
+  process names like plugin-container.
+- Never use dashes as punctuation: no em dash, no en dash, no hyphen between
+  clauses. Rephrase with commas, colons or separate sentences.
+"""
+
+ADVICE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "headline": {"type": "string"},
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "fix": {"type": ["string", "null"]},
+                },
+                "required": ["text", "fix"],
+            },
+        },
+    },
+    "required": ["headline", "steps"],
+}
+
+
+def _lz4_block(src, size):
+    """Decode one raw LZ4 block. Zen's session file is LZ4 and python has no lz4 built in."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        tok = src[i]
+        i += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n or len(dst) >= size:
+            break
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        start = len(dst) - off
+        if off >= ml:
+            dst += dst[start:start + ml]
+        else:
+            for k in range(ml):
+                dst.append(dst[start + k])
+    return bytes(dst)
+
+
+def browser_tabs(limit=80):
+    """Open tabs in Zen, from its session recovery file."""
+    import glob
+    files = glob.glob(os.path.join(
+        HOME, "Library/Application Support/zen/Profiles/*/sessionstore-backups/recovery.jsonlz4"))
+    if not files:
+        return []
+    path = max(files, key=os.path.getmtime)
+    try:
+        raw = open(path, "rb").read()
+        if raw[:8] != b"mozLz40\0":
+            return []
+        size = int.from_bytes(raw[8:12], "little")
+        data = json.loads(_lz4_block(raw[12:], size))
+    except Exception:
+        return []
+    tabs = []
+    for w in data.get("windows", []):
+        for t in w.get("tabs", []):
+            entries = t.get("entries") or []
+            if not entries:
+                continue
+            e = entries[min(max(t.get("index", 1), 1), len(entries)) - 1]
+            url = e.get("url", "")
+            if url.startswith("about:"):
+                continue
+            # host only: paths carry message ids and document names that add nothing here
+            host = re.match(r"[a-z]+://([^/?#]+)", url)
+            tabs.append({"title": e.get("title", "")[:100], "site": host.group(1) if host else url[:40],
+                         "last_used_min_ago": int((time.time() * 1000 - t.get("lastAccessed", 0)) / 60000)
+                         if t.get("lastAccessed") else None})
+    tabs.sort(key=lambda t: t["last_used_min_ago"] if t["last_used_min_ago"] is not None else 1e9)
+    return tabs[:limit]
+
+
+def listening_servers():
+    out = sh(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"])
+    by_pid = {}
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 9 or not parts[1].isdigit():
+            continue
+        port = parts[8].rsplit(":", 1)[-1]
+        by_pid.setdefault(int(parts[1]), set()).add(port)
+    clients = {}
+    for line in sh(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED"]).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 9 and "->" in parts[8]:
+            local, remote = parts[8].split("->", 1)
+            # the client end: its remote side is the server's port
+            port = remote.rsplit(":", 1)[-1]
+            clients.setdefault(port, set()).add(parts[0])
+    procs = {p["pid"]: p for p in processes()}
+    managed = launchd_pids()
+    rows = []
+    for pid, ports in by_pid.items():
+        p = procs.get(pid)
+        if not p or p["cmd"].startswith(("/System", "/usr/libexec", "/usr/sbin")):
+            continue
+        cwd = ""
+        for ln in sh(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]).splitlines():
+            if ln.startswith("n"):
+                cwd = ln[1:].replace(HOME, "~")
+        rows.append({"pid": pid, "ports": sorted(ports), "cwd": cwd, "cmd": p["cmd"][:120],
+                     "age": duration(p["age"]), "launchd_managed": pid in managed or p["ppid"] in managed,
+                     "connected_clients_now": sorted(set().union(*(clients.get(pt, set()) for pt in ports)))})
+    return rows
+
+
+def gather_context(findings):
+    procs = processes()
+    top_cpu = sorted(procs, key=lambda p: -p["cpu"])[:20]
+    top_mem = sorted(procs, key=lambda p: -p["rss"])[:12]
+    seen, plist = set(), []
+    for p in top_cpu + top_mem:
+        if p["pid"] in seen:
+            continue
+        seen.add(p["pid"])
+        plist.append({"pid": p["pid"], "ppid": p["ppid"], "cpu_pct": round(p["cpu"]),
+                      "rss": human(p["rss"]), "age": duration(p["age"]), "cmd": p["cmd"][:160]})
+    counts = {}
+    for p in procs:
+        counts[p["name"]] = counts.get(p["name"], 0) + 1
+    st = os.statvfs("/System/Volumes/Data")
+    boot = re.search(r"sec = (\d+)", sh(["sysctl", "-n", "kern.boottime"]))
+    registry = os.path.join(HOME, ".claude/reference/local-ports.md")
+    return {
+        "now": time.strftime("%A %d %b %Y %H:%M"),
+        "machine": {
+            "model": sh(["sysctl", "-n", "machdep.cpu.brand_string"]).strip(),
+            "ram": human(total_ram()),
+            "cores": int(sh(["sysctl", "-n", "hw.ncpu"]).strip() or 0),
+        },
+        "load_average_1_5_15": [round(x, 1) for x in os.getloadavg()],
+        "cpu_idle_pct": round(cpu_idle()) if cpu_idle() is not None else None,
+        "memory_pressure": {1: "normal", 2: "warning", 4: "critical"}.get(pressure_level(), "unknown"),
+        "swap": sh(["sysctl", "-n", "vm.swapusage"]).strip(),
+        "disk_free": human(st.f_bavail * st.f_frsize),
+        "uptime": duration(int(time.time() - int(boot.group(1)))) if boot else None,
+        "findings": [{"severity": SEV_NAME[f.sev], "title": f.title, "detail": f.detail,
+                      "evidence": f.evidence[:8]} for f in findings if f.sev != OK],
+        "available_fixes": [{"id": f.fix.id, "action": f.fix.label, "for_finding": f.title,
+                             "command": f.fix.cmd if isinstance(f.fix.cmd, str) else " ".join(f.fix.cmd)}
+                            for f in findings if f.fix and f.sev != OK],
+        "processes": plist,
+        "process_counts": {k: v for k, v in sorted(counts.items(), key=lambda x: -x[1])[:15] if v > 2},
+        "listening_servers": listening_servers(),
+        "zen_tabs_most_recent_first": browser_tabs(),
+        "port_registry": open(registry).read()[:12000] if os.path.exists(registry) else None,
+    }
+
+
+def ask_claude(ctx, timeout=120):
+    exe = shutil.which("claude") or os.path.join(HOME, ".local/bin/claude")
+    if not os.path.exists(exe):
+        raise RuntimeError("the claude command is not installed")
+    r = subprocess.run(
+        [exe, "-p", "--model", "sonnet", "--system-prompt", ADVISOR_PROMPT,
+         "--tools", "", "--setting-sources", "", "--no-session-persistence",
+         "--output-format", "json", "--json-schema", json.dumps(ADVICE_SCHEMA)],
+        input=json.dumps(ctx), capture_output=True, text=True, timeout=timeout,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:200] or "no response")
+    if out.get("is_error") or not isinstance(out.get("structured_output"), dict):
+        raise RuntimeError(str(out.get("result") or "no structured answer")[:200])
+    return out["structured_output"]
+
+
+def with_spinner(label, fn):
+    """Run fn in a thread while a rainbow sweeps, so the wait is visibly alive."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except Exception as e:
+            box["error"] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    started = time.time()
+    tty = sys.stdout.isatty()
+    while t.is_alive():
+        if tty:
+            dots = "".join("█" if (i + int((time.time() - started) * 8)) % 10 < 5 else "░" for i in range(10))
+            sys.stdout.write(f"\r  {rainbow(dots, time.time() * 0.35)} {GREY}{label} "
+                             f"{int(time.time() - started)}s{RESET}   ")
+            sys.stdout.flush()
+        t.join(0.1)
+    if tty:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def advise(findings):
+    """Claude's plan, then one keypress for the steps whyslow can run."""
+    ctx = gather_context(findings)
+    try:
+        advice = with_spinner("asking Claude", lambda: ask_claude(ctx))
+    except Exception as e:
+        report(findings)
+        print(f"  {GREY}Claude unavailable ({str(e)[:120]}). This is the rule based report.{RESET}")
+        print()
+        return
+
+    fixes = {f.fix.id: f for f in findings if f.fix}
+    print()
+    print(rainbow("  why this mac is slow  ", time.time() * 0.2))
+    print()
+    for line in wrap(advice.get("headline", ""), 76):
+        print(f"  {BOLD}{WHITE}{line}{RESET}")
+    print()
+
+    steps = advice.get("steps") or []
+    runnable = []
+    for i, step in enumerate(steps, 1):
+        f = fixes.get(step.get("fix"))
+        lines = wrap(step.get("text", ""), 72)
+        print(f"  {WHITE}{i}.{RESET} {WHITE}{lines[0] if lines else ''}{RESET}")
+        for line in lines[1:]:
+            print(f"     {WHITE}{line}{RESET}")
+        if f:
+            runnable.append((i, f))
+            gain = f", frees about {human(f.fix.gain)}" if f.fix.gain else ""
+            who = "whyslow asks before this one" if f.fix.heavy else "whyslow does this"
+            print(f"     {SEV_COLOR[OK]}{who}{RESET}{GREY}{gain}{RESET}")
+        else:
+            print(f"     {GREY}yours{RESET}")
+        print()
+
+    if not steps:
+        print(f"  {GREY}No steps.{RESET}")
+        print()
+    if not runnable or not sys.stdin.isatty():
+        return
+
+    nums = [str(i) for i, _ in runnable]
+    which = nums[0] if len(nums) == 1 else ", ".join(nums[:-1]) + " and " + nums[-1]
+    try:
+        ans = input(f"  {GREY}Press {WHITE}enter{GREY} to do {which}, or {WHITE}q{GREY} to leave it.{RESET} ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if ans.strip().lower() not in ("", "y", "yes"):
+        return
+    print()
+    for i, f in runnable:
+        fix = f.fix
+        if fix.heavy:
+            shown = fix.cmd if isinstance(fix.cmd, str) else " ".join(fix.cmd)
+            print(f"  {WHITE}{i}.{RESET} {fix.label}")
+            print(f"     {DIM}{GREY}{shown[:200]}{RESET}")
+            if fix.caution:
+                print(f"     {SEV_COLOR[MED]}{fix.caution}{RESET}")
+            try:
+                if input("     do it? [y/N] ").strip().lower() != "y":
+                    print(f"     {GREY}skipped{RESET}\n")
+                    continue
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+        run_fix(i, fix)
+
+
+def run_fix(i, fix):
+    # reclaim is interactive, so it gets the terminal instead of captured output
+    interactive = not isinstance(fix.cmd, str) and fix.cmd[:1] == ["reclaim"]
+    r = subprocess.run(fix.cmd, shell=isinstance(fix.cmd, str),
+                       capture_output=not interactive, text=True)
+    if r.returncode == 0:
+        print(f"  {WHITE}{i}.{RESET} {fix.label}: {SEV_COLOR[OK]}done{RESET}")
+    else:
+        err = (r.stderr or "").strip()[:200] if not interactive else f"exit {r.returncode}"
+        print(f"  {WHITE}{i}.{RESET} {fix.label}: {SEV_COLOR[CRIT]}failed{RESET} {GREY}{err}{RESET}")
+    print()
+
+
 # ------------------------------------------------------------------- display
 
 
@@ -613,6 +1042,10 @@ def rainbow(text, phase=0.0):
 def scan(animate=True):
     """Run every check, sweeping a rainbow while it works."""
     findings = []
+    live_cpu._cache = None
+    processes._cache = None
+    processes()
+    live_cpu()
     tty = sys.stdout.isatty() and animate
     for i, (name, fn) in enumerate(CHECKS):
         if tty:
@@ -626,6 +1059,11 @@ def scan(animate=True):
     if tty:
         sys.stdout.write("\r" + " " * 60 + "\r")
         sys.stdout.flush()
+    n = 0
+    for f in findings:
+        if f.fix:
+            n += 1
+            f.fix.id = f"f{n}"
     return findings
 
 
@@ -660,7 +1098,7 @@ def report(findings, show_ok=False):
             print(f"    {SEV_COLOR[OK]}fix:{RESET} {WHITE}{f.fix.label}{RESET}{GREY}{gain}{RESET}")
         print()
 
-    if problems and any(f.fix for f in problems):
+    if problems and any(f.fix for f in problems) and "--fix" not in sys.argv:
         print(f"  {GREY}Run {WHITE}whyslow --fix{GREY} to be walked through the fixes one at a time.{RESET}")
         print()
 
@@ -714,8 +1152,10 @@ def main():
     ap = argparse.ArgumentParser(
         prog="whyslow",
         description="Work out why this Mac is slow.")
+    ap.add_argument("--plain", action="store_true",
+                    help="skip Claude and print the rule based report")
     ap.add_argument("--fix", action="store_true",
-                    help="after the report, offer each fix one at a time")
+                    help="rule based report, then offer each fix one at a time")
     ap.add_argument("--yes", action="store_true",
                     help="with --fix, apply every offered fix without asking")
     ap.add_argument("--all", action="store_true",
@@ -750,9 +1190,12 @@ def main():
         } for f in sorted(findings, key=lambda f: f.sev)], indent=2))
         return
 
-    report(findings, show_ok=args.all)
-    if args.fix:
-        apply_fixes(sorted(findings, key=lambda f: f.sev), assume_yes=args.yes)
+    if args.plain or args.fix or args.all:
+        report(findings, show_ok=args.all)
+        if args.fix:
+            apply_fixes(sorted(findings, key=lambda f: f.sev), assume_yes=args.yes)
+    else:
+        advise(findings)
 
     worst = min((f.sev for f in findings), default=OK)
     sys.exit(1 if worst <= HIGH else 0)

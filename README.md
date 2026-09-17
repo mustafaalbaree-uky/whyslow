@@ -3,15 +3,30 @@
 One command that answers "why is this Mac slow right now".
 
 ```
-whyslow           # the report
-whyslow --fix     # the report, then offer each reclaim one at a time
+whyslow           # Claude reads the measurements and gives a short plan
+whyslow --plain   # the rule based report, no Claude
+whyslow --fix     # the rule based report, then offer each fix one at a time
 whyslow --watch   # live, refreshing
 whyslow --all     # include the checks that passed
 whyslow --json    # machine readable
 ```
 
-Read only unless you pass `--fix`, and even then every action asks first and
-shows you the exact command before it runs.
+## The plan
+
+`whyslow` runs its checks, then sends Claude (headless `claude -p`, Sonnet, no
+tools) the findings, a live one second CPU sample per process, memory pressure,
+listening servers with their project folder and any clients connected to them,
+the open Zen tabs (title and host only, read from the session recovery file),
+and `~/.claude/reference/local-ports.md`. Claude returns a headline and up to
+five steps. A step either names one of whyslow's own fixes by id or is left to
+you; Claude cannot invent a command.
+
+Press Enter to run the steps whyslow owns. Fixes that stop a process run
+straight away. Fixes that delete data or hand off to reclaim (simulator
+runtimes, local snapshots, build artifact) still ask y/N on their own.
+
+If `claude` is missing or fails, whyslow prints the rule based report instead.
+The call takes about 25 seconds; the checks take about 2.
 
 ## What it checks
 
@@ -76,3 +91,9 @@ was normal. Swap lingers for days after the demand that caused it, so the memory
 checks now gate on `kern.memorystatus_vm_pressure_level` and scale with
 `hw.memsize`. Dev servers, Claude sessions and VMs are rated by their share of
 RAM rather than by count.
+
+Also fixed on 17 Sep 2026: servers kept alive by a LaunchAgent (Queue, lecpipe)
+are no longer reported as stale, since killing one only restarts it; a launcher
+and the process it started count as one server, not duplicates; and the
+simulator runtime fix never deletes the newest iOS runtime, which device builds
+to the iPhone depend on. It used to run `simctl runtime delete all`.
