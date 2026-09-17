@@ -297,14 +297,45 @@ def _trash_top(trash, n=4):
     return ev
 
 
+def total_ram():
+    return int(sh(["sysctl", "-n", "hw.memsize"]).strip() or 0) or 8 * 1024**3
+
+
+def pressure_level():
+    # The kernel's own verdict: 1 normal, 2 warning, 4 critical.
+    try:
+        return int(sh(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip())
+    except ValueError:
+        return 1
+
+
 def check_memory():
     findings = []
+    ram = total_ram()
+    pressure = pressure_level()
+    # Swap and compressed pages linger long after the demand that caused them.
+    # On a machine with room to spare they are history, not a slowdown, so they
+    # only count when the kernel says memory is actually tight.
+    tight = pressure >= 2
+    if pressure >= 4:
+        findings.append(Finding(
+            CRIT, "Memory pressure critical",
+            f"macOS reports critical memory pressure on {human(ram)} of RAM.",
+        ))
+    elif pressure == 2:
+        findings.append(Finding(
+            HIGH, "Memory pressure elevated",
+            f"macOS reports memory pressure at warning level on {human(ram)} of RAM.",
+        ))
+
     swap = sh(["sysctl", "-n", "vm.swapusage"])
     m = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M", swap)
     if m:
         total_s, used_s = float(m.group(1)), float(m.group(2))
         pct = 100.0 * used_s / total_s if total_s else 0
-        if pct > 88:
+        if not tight:
+            pass
+        elif pct > 88:
             findings.append(Finding(
                 CRIT, "Swap is full",
                 f"{used_s / 1024:.1f} GB of {total_s / 1024:.1f} GB swap in use, {pct:.0f} percent. "
@@ -328,7 +359,7 @@ def check_memory():
 
     compressed = pages("Pages stored in compressor")
     occupied = pages("Pages occupied by compressor")
-    if occupied * pagesize > 2 * 1024**3:
+    if tight and occupied * pagesize > 0.25 * ram:
         ratio = compressed / occupied if occupied else 0
         findings.append(Finding(
             HIGH, "Memory compressor working hard",
@@ -338,8 +369,7 @@ def check_memory():
         ))
 
     hogs = sorted(processes(), key=lambda p: -p["rss"])[:6]
-    total_ram = int(sh(["sysctl", "-n", "hw.memsize"]).strip() or 0)
-    if hogs and hogs[0]["rss"] > 0.15 * total_ram:
+    if hogs and hogs[0]["rss"] > 0.15 * ram:
         findings.append(Finding(
             MED, "Largest memory user",
             f"{os.path.basename(hogs[0]['cmd'].split()[0])} is holding {human(hogs[0]['rss'])}.",
@@ -409,7 +439,7 @@ def check_stale_servers():
 
     ram = sum(p["rss"] for p, _ in stale)
     return [Finding(
-        HIGH if len(stale) >= 3 else MED,
+        HIGH if ram > 0.10 * total_ram() else MED if ram > 0.02 * total_ram() else LOW,
         "Dev servers still running",
         f"{len(stale)} server(s) from earlier sessions are still up, holding {human(ram)}.",
         evidence=ev,
@@ -460,7 +490,8 @@ def check_claude_sessions():
     ev = [f"{human(p['rss']):>9}  {duration(p['age']):>5} old  pid {p['pid']}"
           for p in sorted(sessions, key=lambda p: -p["rss"])[:8]]
     old = [p for p in sessions if p["age"] > 12 * 3600]
-    sev = HIGH if len(sessions) >= 7 else MED
+    share = ram / total_ram()
+    sev = HIGH if share > 0.25 else MED if share > 0.10 else LOW
     detail = f"{len(sessions)} Claude Code sessions open, holding {human(ram)} between them."
     if old:
         detail += f" {len(old)} of them have been open longer than 12 hours."
@@ -543,9 +574,9 @@ def check_containers():
         return []
     ram = sum(p["rss"] for p in heavy)
     return [Finding(
-        HIGH if ram > 1024**3 else MED, "A virtual machine is running",
-        f"{len(heavy)} VM or container process(es) holding {human(ram)}. "
-        "On 8 GB of RAM this is usually the difference between fine and unusable.",
+        HIGH if ram > 0.25 * total_ram() else MED, "A virtual machine is running",
+        f"{len(heavy)} VM or container process(es) holding {human(ram)} "
+        f"of {human(total_ram())} RAM.",
         evidence=[f"{human(p['rss']):>9}  pid {p['pid']:<7} {p['name']}" for p in heavy],
     )]
 
