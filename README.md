@@ -3,13 +3,24 @@
 One command that answers "why is this Mac slow right now".
 
 ```
-whyslow           # Claude reads the measurements and gives a short plan
+whyslow           # in a terminal: opens a Claude session that runs the whyslow skill
 whyslow --plain   # the rule based report, no Claude
 whyslow --fix     # the rule based report, then offer each fix one at a time
 whyslow --watch   # live, refreshing
 whyslow --all     # include the checks that passed
 whyslow --json    # machine readable
 ```
+
+## In a terminal: a Claude session
+
+Since 4 Oct 2026, bare `whyslow` typed in a terminal runs `claude whyslow`. The
+`whyslow` skill (`~/.claude/skills/whyslow/SKILL.md`) gathers `whyslow --plain --json`
+plus a live `top` sample, traces each busy process to its project, and reports what is
+broken, what is busy but normal (the Starloft crew loop counts as normal), what can be
+fixed and what cannot. The launcher is `~/.local/bin/whyslow`, copied at
+`tools/whyslow-launcher.sh`. Any flag, a pipe, or a call from inside Claude
+(`CLAUDECODE` set) runs the program directly, so the headless plan below is still
+reachable with `whyslow < /dev/null` or from a Claude session.
 
 ## The plan
 
