@@ -661,7 +661,54 @@ def check_containers():
     )]
 
 
+LAGMYMAC_STATE = os.path.join(HOME, ".lagmymac", "state.json")
+
+
+def check_lagmymac():
+    """lagmymac (~/Code/lagmymac) lags the Mac on purpose. Its max level pushes apps
+    into swap for minutes after it ends, and on 7 Oct 2026 it left Terminal.app hung,
+    while the other checks only saw a vague load spike. Name it first."""
+    procs = [p for p in processes() if re.search(r"/lagmymac\b", p["cmd"]) and "whyslow" not in p["cmd"]]
+    try:
+        with open(LAGMYMAC_STATE) as fh:
+            st = json.load(fh)
+        saved_at = os.path.getmtime(LAGMYMAC_STATE)
+    except (OSError, ValueError):
+        st, saved_at = {}, 0
+    now = time.time()
+    span = lambda secs: f"{secs}s" if secs < 60 else duration(secs)
+    level = st.get("level")
+    deadline = st.get("deadline") or 0
+    ev = [f"pid {p['pid']:<7} up {duration(p['age']):>4}  {p['cmd'][-60:]}" for p in procs[:4]]
+
+    if procs and deadline > now:
+        return [Finding(
+            HIGH, "lagmymac is running",
+            f"lagmymac is lagging the Mac on purpose at {level} level, and ends in "
+            f"{span(int(deadline - now))}.",
+            fix=Fix("Stop lagmymac now", ["lagmymac", "stop"]), evidence=ev,
+        )]
+    if procs:
+        ended = f"Its {level} run ended {span(int(now - deadline))} ago" if deadline else "No run is active"
+        return [Finding(
+            HIGH, "lagmymac is still running after its run",
+            f"{ended}, but the process is still there. It hung like this on 7 Oct 2026 "
+            "when the terminal it draws in froze.",
+            fix=Fix("Stop lagmymac", ["lagmymac", "stop"]), evidence=ev,
+        )]
+    ended_at = min(deadline, now) if deadline else saved_at
+    if ended_at and now - ended_at < 20 * 60:
+        return [Finding(
+            MED, "lagmymac ran recently",
+            f"A lagmymac run{' at ' + level + ' level' if level else ''} ended "
+            f"{span(int(now - ended_at))} ago. Apps it pushed into swap stay slow until they "
+            "load back in. One that stays frozen after that needs a force quit.",
+        )]
+    return []
+
+
 CHECKS = [
+    ("lagmymac", check_lagmymac),
     ("disk", check_disk),
     ("memory", check_memory),
     ("cpu", check_load),

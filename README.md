@@ -57,6 +57,9 @@ sessions are open at once.
 **System.** Spotlight reindexing, photo and media analysis, Time Machine, iCloud
 sync, thermal throttling, a stuck screenshot tool, running VMs, and uptime.
 
+**lagmymac.** A lagmymac run in progress, one that ended but left its process
+behind, or one that ended in the last 20 minutes and may still have apps in swap.
+
 ## How this differs from reclaim
 
 `~/Code/reclaim` is the cleanup tool: it finds regenerable build artifact and
