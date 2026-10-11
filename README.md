@@ -45,8 +45,10 @@ The call takes about 25 seconds; the checks take about 2.
 Time Machine local snapshots, and the large folders in your home directory.
 
 **Memory.** The kernel's memory pressure level, then swap and the compressor,
-and the biggest resident process. Swap and compressor only count while pressure
-is elevated, and every memory threshold is a share of installed RAM.
+and the biggest memory user as `top` sees it, so memory held through the GPU
+counts. Swap and compressor only count while memory is tight: pressure elevated,
+or the compressor holding over a quarter of RAM with under a tenth unused. Every
+memory threshold is a share of installed RAM.
 
 **CPU.** Load average against core count, and anything above 15 percent.
 
@@ -105,6 +107,13 @@ was normal. Swap lingers for days after the demand that caused it, so the memory
 checks now gate on `kern.memorystatus_vm_pressure_level` and scale with
 `hw.memsize`. Dev servers, Claude sessions and VMs are rated by their share of
 RAM rather than by count.
+
+On 11 Oct 2026 the opposite happened: ComfyUI held 18 GB of GPU memory, the
+compressor swelled to 16 GB, swap was 4 GB of 5, and the Mac was paging on every
+click while the pressure level still read normal and `ps` showed ComfyUI at
+778 MB. So a compressor over a quarter of RAM with under a tenth unused now
+counts as tight on its own, the biggest user comes from `top` rather than `ps`,
+and when it is ComfyUI the fix asks it to unload its models over its own API.
 
 Also fixed on 17 Sep 2026: servers kept alive by a LaunchAgent (Queue, lecpipe)
 are no longer reported as stale, since killing one only restarts it; a launcher

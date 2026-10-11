@@ -317,14 +317,55 @@ def pressure_level():
         return 1
 
 
+def top_memory(n=8):
+    """The biggest memory users as top sees them. ps rss misses memory a process
+    holds through the GPU (Metal, PyTorch MPS, Ollama), which on Apple silicon is
+    ordinary wired RAM. On 11 Oct 2026 ComfyUI showed 778 MB in ps and 25 GB in top."""
+    out = sh(["top", "-l", "1", "-o", "mem", "-n", str(n), "-stats", "pid,mem"], timeout=30)
+    mult = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "B": 1}
+    rows = []
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+([\d.]+)([KMGB])", line)
+        if m:
+            rows.append((int(m.group(1)), int(float(m.group(2)) * mult[m.group(3)])))
+    return rows
+
+
+def cwd_of(pid):
+    for ln in sh(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]).splitlines():
+        if ln.startswith("n"):
+            return ln[1:]
+    return ""
+
+
 def check_memory():
     findings = []
     ram = total_ram()
     pressure = pressure_level()
+
+    vm = sh(["vm_stat"])
+    pagesize = 16384
+    pm = re.search(r"page size of (\d+)", vm)
+    if pm:
+        pagesize = int(pm.group(1))
+    stats = dict(re.findall(r'"?([A-Za-z ,\-]+?)"?:\s+(\d+)', vm))
+
+    def pages(key):
+        return int(stats.get(key, 0))
+
+    free = (pages("Pages free") + pages("Pages speculative")) * pagesize
+    compressed = pages("Pages stored in compressor") * pagesize
+    occupied = pages("Pages occupied by compressor") * pagesize
+
     # Swap and compressed pages linger long after the demand that caused them.
     # On a machine with room to spare they are history, not a slowdown, so they
-    # only count when the kernel says memory is actually tight.
-    tight = pressure >= 2
+    # only count when memory is actually tight. The kernel's pressure level is
+    # the first word on that, but not the last: on 11 Oct 2026 it still read
+    # normal while the compressor held 16 GB of a 36 GB machine and 2 GB sat
+    # unused, and every click was paying for it. A big compressor with almost
+    # nothing free is tight whatever the level says.
+    squeezed = occupied > 0.25 * ram and free < 0.10 * ram
+    tight = pressure >= 2 or squeezed
     if pressure >= 4:
         findings.append(Finding(
             CRIT, "Memory pressure critical",
@@ -355,33 +396,42 @@ def check_memory():
                 f"{used_s / 1024:.1f} GB of {total_s / 1024:.1f} GB swap in use, {pct:.0f} percent.",
             ))
 
-    vm = sh(["vm_stat"])
-    pagesize = 16384
-    pm = re.search(r"page size of (\d+)", vm)
-    if pm:
-        pagesize = int(pm.group(1))
-    stats = dict(re.findall(r'"?([A-Za-z ,\-]+?)"?:\s+(\d+)', vm))
-
-    def pages(key):
-        return int(stats.get(key, 0))
-
-    compressed = pages("Pages stored in compressor")
-    occupied = pages("Pages occupied by compressor")
-    if tight and occupied * pagesize > 0.25 * ram:
+    if tight and occupied > 0.25 * ram:
         ratio = compressed / occupied if occupied else 0
-        findings.append(Finding(
-            HIGH, "Memory compressor working hard",
-            f"{human(occupied * pagesize)} of RAM is holding {human(compressed * pagesize)} "
-            f"of compressed pages, a {ratio:.1f} to 1 squeeze. "
-            "Everything you touch has to be decompressed first.",
-        ))
+        detail = (
+            f"{human(occupied)} of RAM is holding {human(compressed)} "
+            f"of compressed pages, a {ratio:.1f} to 1 squeeze, with {human(free)} unused. "
+            "Everything you touch has to be decompressed first."
+        )
+        if pressure < 2:
+            detail += " The kernel's pressure level still says normal, so other tools will not show this."
+        findings.append(Finding(HIGH, "Memory compressor working hard", detail))
 
-    hogs = sorted(processes(), key=lambda p: -p["rss"])[:6]
-    if hogs and hogs[0]["rss"] > 0.15 * ram:
+    # Rank by what top sees, so GPU backed memory counts. Fall back to ps rss.
+    procs = {p["pid"]: p for p in processes()}
+    ranked = [(pid, mem) for pid, mem in top_memory() if pid in procs]
+    if not ranked:
+        ranked = [(p["pid"], p["rss"]) for p in sorted(processes(), key=lambda p: -p["rss"])[:6]]
+    if ranked and ranked[0][1] > 0.15 * ram:
+        pid, mem = ranked[0]
+        hog = procs[pid]
+        cwd = cwd_of(pid)
+        where = cwd.replace(HOME, "~")
+        detail = f"{hog['name']} is holding {human(mem)}"
+        detail += f", running from {where}." if where and where != "/" else "."
+        fix = None
+        if "ComfyUI" in cwd or "ComfyUI" in hog["cmd"]:
+            pm = re.search(r"--port\s+(\d+)", hog["cmd"])
+            port = pm.group(1) if pm else "8188"
+            detail += (" ComfyUI keeps the last model loaded after a render finishes, "
+                       "so this stays until something unloads it.")
+            fix = Fix("Ask ComfyUI to unload its models, keeping the server up",
+                      ["curl", "-s", "-X", "POST", f"http://127.0.0.1:{port}/free",
+                       "-H", "Content-Type: application/json",
+                       "-d", '{"unload_models": true, "free_memory": true}'])
         findings.append(Finding(
-            MED, "Largest memory user",
-            f"{os.path.basename(hogs[0]['cmd'].split()[0])} is holding {human(hogs[0]['rss'])}.",
-            evidence=[f"{human(p['rss']):>10}  pid {p['pid']:<7} {p['name']}" for p in hogs],
+            HIGH if squeezed else MED, "Largest memory user", detail, fix=fix,
+            evidence=[f"{human(m):>10}  pid {pd:<7} {procs[pd]['name']}" for pd, m in ranked[:6]],
         ))
 
     if not findings:
@@ -743,7 +793,8 @@ How to judge:
   counts threads waiting on disk and locks, so trust cpu_idle_pct over it.
 - A local server with connected_clients_now is being used by something.
 - Swap and compressed memory linger for days. They only matter when
-  memory_pressure is not normal.
+  memory_pressure is not normal, or when the compressor holds over a quarter
+  of RAM with under a tenth unused (the kernel level lags that case).
 - Findings marked severe can be wrong; overrule them. If nothing meaningful is
   slowing the Mac, say so and return no steps.
 
